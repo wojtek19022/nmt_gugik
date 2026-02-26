@@ -1,24 +1,21 @@
-import requests
+from qgis.PyQt.QtCore import QUrl, QUrlQuery, QEventLoop
+from qgis.PyQt.QtWidgets import QDialog
 
+from .constants import NMT_SERVICE_URL
+from . import PLUGIN_NAME, PLUGIN_VERSION
+from .utils import QgisNetworkClient
+
+if not hasattr(QEventLoop, 'exec'):
+    QEventLoop.exec = QEventLoop.exec_
+
+if not hasattr(QDialog, 'exec'):
+    QDialog.exec = QDialog.exec_
 
 class NmtAPI:
 
-    URL = "http://services.gugik.gov.pl/nmt/"
+    URL = NMT_SERVICE_URL
 
-    def getRequest(PARAMS):
-        try:
-            r = requests.get(url=NmtAPI.URL, params=PARAMS)
-        except requests.exceptions.ConnectionError:
-            return None
-        r_txt = r.text
-        if r.status_code == 200:
-            return r_txt
-        else:
-            return None
-
-    def getHbyXY(x, y):
-        PARAMS = {'request': "GetHbyXY", 'x': x, 'y': y}
-        return NmtAPI.getRequest(PARAMS)
-
-
-
+    @staticmethod
+    def getHbyXY(x, y, network_client: QgisNetworkClient) -> str | None:
+        params = {'request': "GetHbyXY", 'x': x, 'y': y}
+        return network_client.getRequest(NmtAPI.URL, params)
