@@ -1,4 +1,4 @@
-name: QGIS plugin repository checker
+name: tester jakości i bezpieczeństwa wtyczki QGIS
 
 on:
   push:
