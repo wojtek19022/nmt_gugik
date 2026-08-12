@@ -1,0 +1,67 @@
+name: QGIS plugin repository checker
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "**.py"
+      - "**/metadata.txt"
+      - ".github/workflows/qgis-plugin-checker.yml"
+  workflow_dispatch:
+
+jobs:
+  qgis-plugin-checker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .   # folder holding metadata.txt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install scanners
+        run: pip install bandit detect-secrets flake8
+
+      - name: Check metadata.txt (blocking)
+        run: |
+          for key in name qgisMinimumVersion description about version author email repository tracker; do
+            grep -qE "^\s*$key\s*=\s*\S" metadata.txt || echo "missing: $key" >> metadata_report.log
+          done
+          [ ! -s metadata_report.log ] || { printf '### metadata.txt\n```\n%s\n```\n' "$(cat metadata_report.log)" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+      - name: Bandit (blocking) — skips read from .bandit
+        run: |
+          bandit -rq . --severity-level high $([ -f .bandit ] && echo --ini .bandit) \
+            --format custom --msg-template "{relpath}:{line}: {test_id} {msg}" > bandit_report.log 2>&1 \
+            || { printf '### Bandit\n```\n%s\n```\n' "$(cat bandit_report.log)" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+      - name: detect-secrets (blocking) — known findings read from .secrets.baseline
+        run: |
+          detect-secrets scan . --all-files --exclude-files '(^|/)(\.git/|\.secrets\.baseline$)' > /tmp/scan.json
+          python - <<'EOF' > secrets_report.log
+          import json, os
+          def hashes(path):
+              if not os.path.exists(path):
+                  return set()
+              data = json.load(open(path)).get("results", {})
+              return {(f, s["hashed_secret"]) for f, items in data.items() for s in items}
+          # Match on file + hash only: line numbers move whenever code above a
+          # secret changes, and a baselined secret must not resurface as new.
+          known = hashes(".secrets.baseline")
+          for f, items in json.load(open("/tmp/scan.json"))["results"].items():
+              for s in items:
+                  if (f, s["hashed_secret"]) not in known:
+                      print(f'{f}:{s["line_number"]}: {s["type"]}')
+          EOF
+          [ ! -s secrets_report.log ] || { printf '### detect-secrets (add to .secrets.baseline if false positive)\n```\n%s\n```\n' "$(cat secrets_report.log)" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+      - name: Flake8 (informational) — ignores read from .flake8
+        run: |
+          flake8 . --exit-zero > flake8_report.log
+          [ ! -s flake8_report.log ] || printf '<details><summary>Flake8 (informational, non-blocking)</summary>\n\n```\n%s\n```\n\n</details>\n' "$(cat flake8_report.log)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports when failure appears
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qgis-plugin-checker-reports
+          path: ./*_report.log
