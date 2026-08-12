@@ -1,4 +1,4 @@
-name: tester jakości i bezpieczeństwa wtyczki QGIS
+name: QGIS plugin repository checker
 
 on:
   push:
@@ -6,6 +6,9 @@ on:
     paths:
       - "**.py"
       - "**/metadata.txt"
+      - "**/.bandit"
+      - "**/.flake8"
+      - "**/.secrets.baseline"
       - ".github/workflows/qgis-plugin-checker.yml"
   workflow_dispatch:
 
@@ -21,6 +24,19 @@ jobs:
       - name: Install scanners
         run: pip install bandit detect-secrets flake8
 
+      - name: Locate config files (plugin folder first, then repo root)
+        run: |
+          find_cfg() { [ -f "$1" ] && echo "$PWD/$1" || { [ -f "$GITHUB_WORKSPACE/$1" ] && echo "$GITHUB_WORKSPACE/$1"; }; }
+          {
+            echo "BANDIT_INI=$(find_cfg .bandit)"
+            echo "FLAKE8_CFG=$(find_cfg .flake8)"
+            echo "SECRETS_BASELINE=$(find_cfg .secrets.baseline)"
+          } | tee -a "$GITHUB_ENV"
+          for f in .bandit .flake8 .secrets.baseline; do
+            [ -f "$f" ] || [ ! -f "$GITHUB_WORKSPACE/$f" ] \
+              || echo "::warning::$f sits in the repository root — plugins.qgis.org only detects it next to metadata.txt"
+          done
+
       - name: Check metadata.txt (blocking)
         run: |
           for key in name qgisMinimumVersion description about version author email repository tracker; do
@@ -30,8 +46,8 @@ jobs:
 
       - name: Bandit (blocking) — skips read from .bandit
         run: |
-          bandit -rq . --severity-level high $([ -f .bandit ] && echo --ini .bandit) \
-            --format custom --msg-template "{relpath}:{line}: {test_id} {msg}" > bandit_report.log 2>&1 \
+          bandit -rq . --severity-level high ${BANDIT_INI:+--ini "$BANDIT_INI"} \
+            --format custom --msg-template "{relpath}:{line}: {test_id} {msg}" > bandit_report.log \
             || { printf '### Bandit\n```\n%s\n```\n' "$(cat bandit_report.log)" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
 
       - name: detect-secrets (blocking) — known findings read from .secrets.baseline
@@ -39,24 +55,31 @@ jobs:
           detect-secrets scan . --all-files --exclude-files '(^|/)(\.git/|\.secrets\.baseline$)' > /tmp/scan.json
           python - <<'EOF' > secrets_report.log
           import json, os
-          def hashes(path):
-              if not os.path.exists(path):
-                  return set()
-              data = json.load(open(path)).get("results", {})
-              return {(f, s["hashed_secret"]) for f, items in data.items() for s in items}
-          # Match on file + hash only: line numbers move whenever code above a
-          # secret changes, and a baselined secret must not resurface as new.
-          known = hashes(".secrets.baseline")
+          plugin = os.path.basename(os.getcwd())
+
+          def norm(path):                      # baselines generated from the repo root
+              path = path[2:] if path.startswith("./") else path
+              prefix = plugin + "/"            # carry a "./" prefix the scan lacks
+              return path[len(prefix):] if path.startswith(prefix) else path
+
+          baseline = os.environ.get("SECRETS_BASELINE", "")
+          known = set()
+          if baseline and os.path.exists(baseline):
+              for f, items in json.load(open(baseline)).get("results", {}).items():
+                  # File + hash only: line numbers move when code above a secret
+                  # changes, and a baselined secret must not resurface as new.
+                  known |= {(norm(f), s["hashed_secret"]) for s in items}
+
           for f, items in json.load(open("/tmp/scan.json"))["results"].items():
               for s in items:
-                  if (f, s["hashed_secret"]) not in known:
-                      print(f'{f}:{s["line_number"]}: {s["type"]}')
+                  if (norm(f), s["hashed_secret"]) not in known:
+                      print(f'{norm(f)}:{s["line_number"]}: {s["type"]}')
           EOF
           [ ! -s secrets_report.log ] || { printf '### detect-secrets (add to .secrets.baseline if false positive)\n```\n%s\n```\n' "$(cat secrets_report.log)" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
 
       - name: Flake8 (informational) — ignores read from .flake8
         run: |
-          flake8 . --exit-zero > flake8_report.log
+          flake8 . --exit-zero ${FLAKE8_CFG:+--config "$FLAKE8_CFG"} > flake8_report.log
           [ ! -s flake8_report.log ] || printf '<details><summary>Flake8 (informational, non-blocking)</summary>\n\n```\n%s\n```\n\n</details>\n' "$(cat flake8_report.log)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload reports when failure appears
