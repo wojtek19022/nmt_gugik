@@ -1,0 +1,98 @@
+name: QGIS Plugin QA
+
+# Mirrors the scan plugins.qgis.org runs on upload:
+# https://plugins.qgis.org/docs/security-scanning
+#   Bandit + detect-secrets = CRITICAL, blocking  -> fail the build
+#   Flake8 + file analysis  = informational       -> report only
+#
+# Suppress false positives with .bandit / .secrets.baseline / .flake8 placed
+# next to the plugin's metadata.txt. They are picked up automatically.
+
+on:
+  push:
+    branches: [master]   # covers direct pushes and merges into master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [.]   # add more folder names here if the repo holds several
+    defaults:
+      run:
+        working-directory: ${{ matrix.plugin }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanners
+        run: pip install bandit==1.8.3 detect-secrets==1.5.0 flake8==7.1.1
+
+      # --- structural validation: the site rejects the upload without these ---
+      - name: Check metadata.txt
+        run: |
+          for key in name qgisMinimumVersion description about version author email repository tracker; do
+            grep -qE "^\s*$key\s*=\s*\S" metadata.txt || { echo "::error::metadata.txt: missing '$key'"; fail=1; }
+          done
+          test -f __init__.py || { echo "::error::__init__.py is missing"; fail=1; }
+          exit ${fail:-0}
+
+      # --- BLOCKING: Bandit (uses .bandit if present) ---
+      - name: Bandit
+        run: |
+          INI=""
+          if [ -f .bandit ]; then INI="--ini .bandit"; fi
+          bandit -r . --severity-level high $INI
+
+      # --- BLOCKING: detect-secrets (uses .secrets.baseline if present) ---
+      - name: detect-secrets
+        run: |
+          if [ -f .secrets.baseline ]; then
+            cp .secrets.baseline /tmp/base.json
+            detect-secrets scan --baseline .secrets.baseline --all-files
+            cp .secrets.baseline /tmp/new.json
+            cp /tmp/base.json .secrets.baseline   # the scan rewrites the timestamp; undo it
+          else
+            echo '{"results": {}}' > /tmp/base.json
+            detect-secrets scan . --all-files > /tmp/new.json
+          fi
+          python - <<'EOF'
+          import json, sys
+          def found(path):
+              data = json.load(open(path))["results"]
+              return {(f, s["hashed_secret"], s["line_number"]) for f, i in data.items() for s in i}
+          new = found("/tmp/new.json") - found("/tmp/base.json")
+          for f, _, line in sorted(new):
+              print(f"::error file={f},line={line}::possible secret — fix it, or add it to .secrets.baseline")
+          sys.exit(1 if new else 0)
+          EOF
+
+      # --- informational: never blocks, exactly like on the server ---
+      - name: Flake8
+        run: flake8 . --exit-zero --statistics
+
+      - name: File analysis
+        run: |
+          find . -path ./.git -prune -o -type f \
+            \( -perm -u+x -o -name '.*' -o -name '*.so' -o -name '*.pyd' -o -name '*.dll' \
+               -o -name '*.exe' -o -name '*.sh' -o -name '*.bat' -o -name '*.pyc' \) -print \
+            | grep -vE '/\.(bandit|flake8|secrets\.baseline|gitignore)$' \
+            | sed 's|^|::warning::suspicious file: |' || true
+
+      # --- package it the way the site expects, dotfiles included ---
+      - name: Build ZIP
+        run: cd .. && zip -qr "${{ matrix.plugin }}.zip" "${{ matrix.plugin }}" -x '*.git*' '*__pycache__*'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.plugin }}-zip
+          path: ${{ matrix.plugin }}.zip
